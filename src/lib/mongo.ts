@@ -1,13 +1,20 @@
 /**
- * Singleton MongoDB client for local persistence.
+ * Singleton MongoDB client for risksi persistence.
  *
- * Connects to a local MongoDB instance at mongodb://localhost:27017/risksi.
+ * Connection string comes from `RISKSI_MONGO_URI` (see `.env.local`). We
+ * point at MongoDB Atlas in shared development; the localhost fallback is
+ * retained only so a brand-new clone without `.env.local` fails loudly
+ * with a clear "can't connect to localhost" rather than a confusing nil.
+ *
  * Collections:
- *   - assessments  — full wizard state (input, artifacts, triagePaste, report)
- *   - caseAnalyses — case analysis workflow state
+ *   - assessments       — full wizard state (input, artifacts, report)
+ *   - artifacts         — delta-fetch cache of Glean gathered artifacts
+ *   - case_intelligence — per-case Auto Triage cache (summary + precedents)
+ *   - events            — usage telemetry for /admin/usage
+ *   - lgtm, risks       — review state attached to reports
  */
 
-import { MongoClient, type Db } from "mongodb";
+import { MongoClient, type Db, type Document } from "mongodb";
 
 const MONGO_URI = process.env.RISKSI_MONGO_URI || "mongodb://localhost:27017";
 const DB_NAME = "risksi";

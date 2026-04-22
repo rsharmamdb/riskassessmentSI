@@ -58,6 +58,25 @@ type AgentEvent =
   | { type: "final"; report: string }
   | { type: "error"; error: string };
 
+/** Per-prompt row shown in the Auto Triage pipeline progress panel. */
+interface TriageLogEntry {
+  key: string;
+  label: string;
+  status: "pending" | "running" | "ok" | "error";
+  detail?: string;
+  durationMs?: number;
+  /** Whether the markdown came from the DB cache or from a fresh Hub call. */
+  source?: "cached" | "fresh";
+  /** Parsed case status (case-summary / precedent-research only). */
+  caseStatus?: "closed" | "open" | "unknown";
+}
+
+interface TriageCacheCounts {
+  hit: number;
+  miss: number;
+  staleRefresh: number;
+}
+
 const STEPS: Step[] = [
   { id: "context", title: "Account Context" },
   { id: "gather", title: "Auto-Gather" },
@@ -359,6 +378,12 @@ export function Wizard() {
   const [gatherLog, setGatherLog] = useState<
     { label: string; status: "pending" | "ok" | "error"; detail?: string }[]
   >([]);
+  const [triageRunning, setTriageRunning] = useState(false);
+  const [triageLog, setTriageLog] = useState<TriageLogEntry[]>([]);
+  const [triageResolvedCases, setTriageResolvedCases] = useState<string[]>([]);
+  const [triageSkipReason, setTriageSkipReason] = useState<string | null>(null);
+  const [triageCacheCounts, setTriageCacheCounts] =
+    useState<TriageCacheCounts | null>(null);
   const [generating, setGenerating] = useState(false);
   const [genError, setGenError] = useState<string | null>(null);
   const [agentEvents, setAgentEvents] = useState<AgentEvent[]>([]);
@@ -697,6 +722,234 @@ export function Wizard() {
       metadata: { forceRefresh, artifactCount: collected.length },
     });
     setGathering(false);
+
+    // Phase 2 — Auto Triage case intelligence. Runs case-summary +
+    // precedent-research per extracted case, then account-support-health.
+    // Kept in runGather's lifecycle so a single Step 2 completion gate
+    // covers both Glean + Auto Triage before proceeding to Step 3.
+    const accountForTriage =
+      updatedInput.canonicalName || updatedInput.accountName;
+    const enrichedArtifacts = await runTriagePipeline(
+      accountForTriage,
+      collected,
+      forceRefresh,
+    );
+    if (enrichedArtifacts !== collected) {
+      setArtifacts(enrichedArtifacts);
+      await dbSaveArtifacts(
+        input.accountName,
+        enrichedArtifacts,
+        sfId ?? input.salesforceId,
+      );
+      await dbSave({
+        input: updatedInput,
+        artifacts: enrichedArtifacts,
+        report,
+      });
+    }
+  }
+
+  /**
+   * Run the Auto Triage pipeline for the cases referenced in `artifacts`.
+   * Streams progress events into `triageLog`, appends a `case-intelligence`
+   * artifact on success. No-op if no case numbers found or if an intelligence
+   * artifact is already present (unless `forceRefresh`).
+   */
+  async function runTriagePipeline(
+    accountName: string,
+    artifacts: GatheredArtifact[],
+    forceRefresh: boolean,
+  ): Promise<GatheredArtifact[]> {
+    setTriageSkipReason(null);
+    setTriageLog([]);
+    setTriageResolvedCases([]);
+    setTriageCacheCounts(null);
+
+    // Note: even if an artifact-level case-intelligence entry already
+    // exists, we still re-run. The per-(case, prompt) MongoDB cache will
+    // skip actual Hub calls for closed / fresh cases and only delta-fetch
+    // the open/stale ones.
+    setTriageRunning(true);
+    try {
+      const res = await fetch("/api/triage/pipeline", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          accountName,
+          salesforceId: input.salesforceId,
+          artifacts: artifacts.filter((a) => a.kind !== "case-intelligence"),
+          forceRefresh,
+        }),
+      });
+
+      if (!res.ok && !res.body) {
+        const err = await res.text().catch(() => "");
+        setTriageSkipReason(`Pipeline unreachable (HTTP ${res.status}) ${err.slice(0, 120)}`);
+        return artifacts;
+      }
+      const reader = res.body?.getReader();
+      if (!reader) {
+        setTriageSkipReason("Pipeline produced no stream");
+        return artifacts;
+      }
+
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let intelligence: unknown = null;
+      let fatalError: string | null = null;
+
+      const keyOf = (promptId: string, caseNumber?: string, batchLabel?: string) =>
+        caseNumber
+          ? `${promptId}:${caseNumber}`
+          : `${promptId}:${batchLabel ?? "all"}`;
+      const labelOf = (promptId: string, caseNumber?: string, batchLabel?: string) => {
+        if (promptId === "case-summary") return `Case ${caseNumber} — summary`;
+        if (promptId === "precedent-research") return `Case ${caseNumber} — precedents`;
+        if (promptId === "account-support-health")
+          return `Account health${batchLabel ? ` (${batchLabel})` : ""}`;
+        return promptId;
+      };
+
+      const processEvent = (json: string) => {
+        let evt: { type?: string; [k: string]: unknown };
+        try {
+          evt = JSON.parse(json);
+        } catch {
+          return;
+        }
+        if (evt.type === "cases_resolved") {
+          const cases = (evt.cases as string[]) ?? [];
+          setTriageResolvedCases(cases);
+          if (cases.length === 0) {
+            fatalError = "No case numbers found in Glean artifacts";
+          }
+        } else if (evt.type === "cache_scan") {
+          const counts = evt.cacheCounts as TriageCacheCounts | undefined;
+          if (counts) setTriageCacheCounts(counts);
+        } else if (evt.type === "prompt_start") {
+          const run = evt.run as {
+            promptId: string;
+            caseNumber?: string;
+            batchLabel?: string;
+            source?: "cached" | "fresh";
+          };
+          const key = keyOf(run.promptId, run.caseNumber, run.batchLabel);
+          setTriageLog((log) => {
+            if (log.some((l) => l.key === key)) {
+              return log.map((l) =>
+                l.key === key
+                  ? { ...l, status: "running", source: run.source }
+                  : l,
+              );
+            }
+            return [
+              ...log,
+              {
+                key,
+                label: labelOf(run.promptId, run.caseNumber, run.batchLabel),
+                status: "running",
+                source: run.source,
+              },
+            ];
+          });
+        } else if (evt.type === "prompt_done") {
+          const run = evt.run as {
+            promptId: string;
+            caseNumber?: string;
+            batchLabel?: string;
+            status: "ok" | "error";
+            error?: string;
+            durationMs?: number;
+            source?: "cached" | "fresh";
+            caseStatus?: "closed" | "open" | "unknown";
+          };
+          const key = keyOf(run.promptId, run.caseNumber, run.batchLabel);
+          setTriageLog((log) =>
+            log.map((l) =>
+              l.key === key
+                ? {
+                    ...l,
+                    status: run.status,
+                    detail: run.error,
+                    durationMs: run.durationMs,
+                    source: run.source ?? l.source,
+                    caseStatus: run.caseStatus,
+                  }
+                : l,
+            ),
+          );
+        } else if (evt.type === "final") {
+          intelligence = evt.intelligence;
+        } else if (evt.type === "error") {
+          fatalError = (evt.error as string) ?? "Pipeline error";
+        }
+      };
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        let sep = buffer.indexOf("\n\n");
+        while (sep !== -1) {
+          const frame = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          const dataLines = frame
+            .split("\n")
+            .filter((l) => l.startsWith("data:"))
+            .map((l) => l.slice(5).trim());
+          if (dataLines.length > 0) processEvent(dataLines.join("\n"));
+          sep = buffer.indexOf("\n\n");
+        }
+      }
+
+      if (fatalError) {
+        setTriageSkipReason(fatalError);
+        return artifacts;
+      }
+      if (!intelligence) {
+        setTriageSkipReason("Pipeline finished without producing intelligence");
+        return artifacts;
+      }
+
+      const intelArtifact: GatheredArtifact = {
+        source: "auto-triage",
+        kind: "case-intelligence",
+        label: "Auto Triage case intelligence",
+        data: intelligence,
+      };
+      const intel = intelligence as {
+        cases?: string[];
+        stats?: {
+          caseCount?: number;
+          promptsRun?: number;
+          promptsReused?: number;
+          promptsFailed?: number;
+          durationMs?: number;
+        };
+      };
+      track({
+        event: "triage_pipeline_run",
+        account: accountName,
+        salesforceId: input.salesforceId,
+        metadata: {
+          cases: intel.cases?.length ?? 0,
+          promptsFetched: intel.stats?.promptsRun ?? 0,
+          promptsReused: intel.stats?.promptsReused ?? 0,
+          promptsFailed: intel.stats?.promptsFailed ?? 0,
+          durationMs: intel.stats?.durationMs ?? 0,
+          forceRefresh,
+        },
+      });
+      return [
+        ...artifacts.filter((a) => a.kind !== "case-intelligence"),
+        intelArtifact,
+      ];
+    } catch (err) {
+      setTriageSkipReason((err as Error).message);
+      return artifacts;
+    } finally {
+      setTriageRunning(false);
+    }
   }
 
   async function runGenerate(forceGenerate = false) {
@@ -1144,10 +1397,10 @@ export function Wizard() {
               right={
                 !gathering && gatherLog.length > 0 ? (
                   <div className="flex items-center gap-2">
-                    <Button variant="secondary" size="sm" onClick={() => { setGatherTriggered(false); runGather(true); }} loading={gathering}>
+                    <Button variant="secondary" size="sm" onClick={() => { setGatherTriggered(false); runGather(true); }} loading={gathering || triageRunning}>
                       Force re-fetch
                     </Button>
-                    {!gatherLog.some((l) => l.status === "pending") && (
+                    {!gatherLog.some((l) => l.status === "pending") && !triageRunning && (
                       <Button onClick={() => setStepIdx(2)}>Continue →</Button>
                     )}
                   </div>
@@ -1298,11 +1551,95 @@ export function Wizard() {
               )}
             </div>
 
+            {/* ── Auto Triage pipeline progress ── */}
+            {(triageRunning || triageLog.length > 0 || triageSkipReason) && (
+              <div className="mt-6 space-y-3 border-t border-ink-700 pt-5">
+                <div className="flex items-center justify-between">
+                  <div>
+                    <div className="text-[11px] font-semibold uppercase tracking-[0.05em] text-ink-300">
+                      Auto Triage Case Intelligence
+                    </div>
+                    <div className="mt-1 text-[12px] text-ink-400">
+                      {triageResolvedCases.length > 0
+                        ? `Analyzing ${triageResolvedCases.length} case${triageResolvedCases.length === 1 ? "" : "s"} — case summary + precedent research per case, plus cross-case pattern analysis.`
+                        : triageRunning
+                          ? "Extracting case numbers from Glean artifacts…"
+                          : "Enrichment complete."}
+                    </div>
+                  </div>
+                  {triageRunning && (
+                    <svg className="animate-spin h-4 w-4 text-accent-400" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                    </svg>
+                  )}
+                </div>
+
+                {triageCacheCounts && (triageCacheCounts.hit > 0 || triageCacheCounts.miss > 0 || triageCacheCounts.staleRefresh > 0) && (
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="border border-ink-700 bg-accent-900 px-3 py-3" style={{ borderRadius: "8px" }}>
+                      <div className="text-[22px] font-semibold tabular-nums text-accent-400">{triageCacheCounts.hit}</div>
+                      <div className="mt-1 text-[11px] text-ink-400">from cache</div>
+                    </div>
+                    <div className="border border-ink-700 bg-accent-900 px-3 py-3" style={{ borderRadius: "8px" }}>
+                      <div className="text-[22px] font-semibold tabular-nums text-ink-200">{triageCacheCounts.miss}</div>
+                      <div className="mt-1 text-[11px] text-ink-400">fetched fresh</div>
+                    </div>
+                    <div className="border border-ink-700 bg-accent-900 px-3 py-3" style={{ borderRadius: "8px" }}>
+                      <div className="text-[22px] font-semibold tabular-nums text-warn">{triageCacheCounts.staleRefresh}</div>
+                      <div className="mt-1 text-[11px] text-ink-400">refreshed (open &gt;7d)</div>
+                    </div>
+                  </div>
+                )}
+
+                {triageLog.length > 0 && (
+                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                    {triageLog.map((l) => {
+                      const status = l.status === "ok" ? "ok" : l.status === "error" ? "error" : "pending";
+                      const sub =
+                        l.status === "error"
+                          ? (l.detail?.slice(0, 80) ?? "Failed")
+                          : l.status === "running"
+                            ? l.source === "cached" ? "Loading from cache…" : "Calling Auto Triage…"
+                            : l.status === "ok"
+                              ? [
+                                  l.source === "cached" ? "From cache" : l.durationMs ? `Fresh · ${Math.round(l.durationMs / 1000)}s` : "Fresh",
+                                  l.caseStatus === "closed" ? "closed" : l.caseStatus === "open" ? "open" : null,
+                                ].filter(Boolean).join(" · ")
+                              : "Queued";
+                      return (
+                        <div
+                          key={l.key}
+                          className={`border border-ink-700 bg-accent-900 px-3 py-2 ${l.status === "running" && l.source !== "cached" ? "animate-pulse" : ""}`}
+                          style={{ borderRadius: "8px" }}
+                        >
+                          <div className="flex items-center gap-2 text-[13px] text-ink-200">
+                            <StatusDot status={status} />
+                            <span className="truncate">{l.label}</span>
+                            {l.source === "cached" && l.status === "ok" && (
+                              <span className="ml-auto text-[10px] px-1.5 py-0.5 bg-accent-700 text-accent-300 rounded">cached</span>
+                            )}
+                          </div>
+                          <div className="mt-1 text-[11px] text-ink-400">{sub}</div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                {triageSkipReason && !triageRunning && (
+                  <div className="text-[12px] text-warn border-l-2 border-warn pl-3">
+                    Skipped Auto Triage: {triageSkipReason}
+                  </div>
+                )}
+              </div>
+            )}
+
             <div className="flex justify-between mt-8">
               <Button variant="ghost" onClick={() => { setGatherTriggered(false); setStepIdx(0); }}>
                 ← Back
               </Button>
-              {!gathering && gatherLog.length > 0 && !gatherLog.some((l) => l.status === "pending") && (
+              {!gathering && !triageRunning && gatherLog.length > 0 && !gatherLog.some((l) => l.status === "pending") && (
                 <Button onClick={() => setStepIdx(2)}>Continue →</Button>
               )}
             </div>
@@ -1421,6 +1758,11 @@ export function Wizard() {
                       a.download = `${input.canonicalName || input.accountName || "account"}-risk-register.md`;
                       a.click();
                       URL.revokeObjectURL(url);
+                      track({
+                        event: "report_downloaded_md",
+                        account: input.accountName,
+                        salesforceId: input.salesforceId,
+                      });
                     }}
                   >
                     Download .md

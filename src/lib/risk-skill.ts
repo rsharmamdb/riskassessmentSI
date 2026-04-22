@@ -467,6 +467,82 @@ export function extractLgtmReviewers(
   return result;
 }
 
+// ---------------------------------------------------------------------------
+// Auto Triage case intelligence — prompt block builder
+// ---------------------------------------------------------------------------
+
+interface CaseIntelligenceData {
+  cases: string[];
+  accountName: string;
+  perCase: Record<
+    string,
+    { summary?: string; precedents?: string; errors?: string[] }
+  >;
+  accountHealth: Array<{ label: string; markdown: string; error?: string }>;
+  stats?: { caseCount: number; promptsRun: number; promptsFailed: number };
+}
+
+/**
+ * If a case-intelligence artifact is present, render it as a prompt block
+ * so the final-synthesis LLM call sees per-case technical depth (problem /
+ * environment / root cause / resolution, plus similar-case precedents, plus
+ * account-level pattern analysis). This is the bit that turns generic
+ * output into specific technical recommendations.
+ *
+ * Returns an empty string if no case-intelligence artifact exists.
+ */
+export function formatCaseIntelligenceBlock(
+  artifacts: Array<{ kind: string; data: unknown }>,
+): string {
+  const artifact = artifacts.find((a) => a.kind === "case-intelligence");
+  if (!artifact) return "";
+  const data = artifact.data as CaseIntelligenceData | null;
+  if (!data || !Array.isArray(data.cases) || data.cases.length === 0) return "";
+
+  const perCaseBlocks = data.cases
+    .map((c) => {
+      const entry = data.perCase[c] ?? {};
+      const parts: string[] = [`### Case ${c}`];
+      if (entry.summary) {
+        parts.push("**Case summary (from Auto Triage):**", entry.summary.slice(0, 6_000));
+      }
+      if (entry.precedents) {
+        parts.push(
+          "**Precedent cases (from Auto Triage):**",
+          entry.precedents.slice(0, 4_000),
+        );
+      }
+      if (!entry.summary && !entry.precedents) {
+        parts.push("_(Auto Triage produced no output for this case)_");
+      }
+      return parts.join("\n\n");
+    })
+    .join("\n\n---\n\n");
+
+  const healthBlocks = data.accountHealth
+    .filter((h) => h.markdown && !h.error)
+    .map((h, i) => {
+      const label =
+        data.accountHealth.length === 1
+          ? "Account support health (from Auto Triage)"
+          : `Account support health — ${h.label}`;
+      return `### ${label}\n\n${h.markdown.slice(0, 10_000)}`;
+    })
+    .join("\n\n---\n\n");
+
+  const sections: string[] = [
+    "## Auto Triage Case Intelligence (pre-analyzed by MongoDB Customer Hub AI — trust as HIGH-confidence technical evidence)",
+    "> The following summaries were produced by running `case-summary` and `precedent-research` prompts against each case's comments, and `account-support-health` across the full case list. Use this as the primary technical evidence for Key Findings, Recommendations, and Appendix B — it contains actual case comments, root causes, and similar-case patterns that Glean's high-level search cannot surface.",
+    "",
+    "### Per-case analysis",
+    perCaseBlocks || "_(no per-case intelligence available)_",
+  ];
+  if (healthBlocks) {
+    sections.push("", "### Cross-case patterns", healthBlocks);
+  }
+  return sections.join("\n\n");
+}
+
 /**
  * Build the explicit LGTM reviewer block to inject into the prompt.
  *

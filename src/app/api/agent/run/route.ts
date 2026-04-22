@@ -15,7 +15,7 @@
  *   - { type: "error",       error }
  */
 
-import { RISK_ASSESSMENT_SKILL, buildLgtmBlock, titleCase } from "@/lib/risk-skill";
+import { RISK_ASSESSMENT_SKILL, buildLgtmBlock, formatCaseIntelligenceBlock, titleCase } from "@/lib/risk-skill";
 import {
   AGENT_TOOLS,
   createAgentContext,
@@ -111,6 +111,7 @@ function formatArtifactsBlock(artifacts: GatheredArtifact[]): string {
 
   const chatArtifacts = artifacts.filter((a) => a.kind === "chat");
   const searchArtifacts = artifacts.filter((a) => a.kind === "search");
+  const caseIntelligenceBlock = formatCaseIntelligenceBlock(artifacts);
 
   const chatBlocks = chatArtifacts
     .map((a) => {
@@ -140,6 +141,11 @@ function formatArtifactsBlock(artifacts: GatheredArtifact[]): string {
     .join("\n\n");
 
   const parts: string[] = [];
+  if (caseIntelligenceBlock) {
+    // Place intelligence first — it's the highest-signal technical evidence
+    // and agent loop should lean on it before falling back to Glean breadth.
+    parts.push(caseIntelligenceBlock);
+  }
   if (chatBlocks) {
     parts.push(
       "## Pre-Gathered Glean Synthesis (from Step 2 — trust as evidence, do NOT re-fetch)",

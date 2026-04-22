@@ -22,13 +22,15 @@ export interface AssessmentInput {
 }
 
 export interface GatheredArtifact {
-  source: "glean";
+  source: "glean" | "auto-triage";
   /**
    * Distinguishes Glean's synthesis (`chat`) from document snippet lookups
    * (`search`). The report generator renders `chat` answers as pre-synthesized
    * markdown (high-signal evidence) and `search` artifacts as raw JSON blocks.
+   * `case-intelligence` carries the full Auto Triage pipeline output
+   * (per-case summaries + precedents + account health) as a structured blob.
    */
-  kind: "search" | "chat";
+  kind: "search" | "chat" | "case-intelligence";
   query?: string;
   label: string;
   data: unknown;

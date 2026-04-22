@@ -5,7 +5,7 @@
  */
 
 import { NextResponse } from "next/server";
-import { RISK_ASSESSMENT_SKILL, buildLgtmBlock, extractLgtmReviewers, titleCase } from "@/lib/risk-skill";
+import { RISK_ASSESSMENT_SKILL, buildLgtmBlock, extractLgtmReviewers, formatCaseIntelligenceBlock, titleCase } from "@/lib/risk-skill";
 import type { AssessmentInput, GatheredArtifact } from "@/lib/types";
 import { callMongoGpt } from "@/lib/mongogpt";
 import { resolveMongoGptMessagesUrl } from "@/lib/mongogpt-url";
@@ -72,6 +72,7 @@ function buildUserMessage(body: Body): string {
 
   const chatArtifacts = artifacts.filter((a) => a.kind === "chat");
   const searchArtifacts = artifacts.filter((a) => a.kind === "search");
+  const caseIntelligenceBlock = formatCaseIntelligenceBlock(artifacts);
 
   const chatBlocks = chatArtifacts
     .map((a) => {
@@ -133,6 +134,8 @@ function buildUserMessage(body: Body): string {
     "",
     lgtmBlock,
     "",
+    caseIntelligenceBlock || null,
+    caseIntelligenceBlock ? "" : null,
     "## Glean Synthesis (pre-analyzed by Glean AI — trust as evidence)",
     chatBlocks ||
       "_(Glean chat produced no content — rely on search artifacts below)_",
@@ -140,7 +143,10 @@ function buildUserMessage(body: Body): string {
     "## Supporting Artifacts (raw Glean search hits)",
     searchBlocks || "_(none)_",
     "",
-    "Draft the complete Risk Register Report now. The Glean Synthesis block contains pre-analyzed, cited content — treat it as High confidence evidence where it names specific cases, JIRA tickets, Slack threads, or PS engagements.",
+    "Draft the complete Risk Register Report now. The Glean Synthesis block contains pre-analyzed, cited content — treat it as High confidence evidence where it names specific cases, JIRA tickets, Slack threads, or PS engagements." +
+      (caseIntelligenceBlock
+        ? " The Auto Triage Case Intelligence block contains per-case technical depth pulled directly from Salesforce case comments — use it as the primary evidence for Key Findings, Recommendations, and Appendix B (Case Review Detail)."
+        : ""),
   ]
     .filter(Boolean)
     .join("\n");

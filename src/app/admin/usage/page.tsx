@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
 import { Card, CardBody, CardHeader } from "@/components/ui";
 
 interface EventDoc {
@@ -9,17 +10,32 @@ interface EventDoc {
   account?: string;
   salesforceId?: string;
   userId?: string;
+  userEmail?: string;
   metadata?: Record<string, unknown>;
   ts: string;
 }
 
-interface Stat { label: string; value: string | number }
+type Window = "30d" | "90d" | "all";
 
-function StatCard({ label, value }: Stat) {
+function StatCard({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string | number;
+  sub?: string;
+}) {
   return (
-    <div className="border border-ink-800 bg-ink-900 px-5 py-4" style={{ borderRadius: '3px' }}>
-      <div className="text-2xl font-semibold tabular-nums">{value}</div>
-      <div className="text-xs text-ink-400 mt-1">{label}</div>
+    <div
+      className="border border-ink-700 bg-accent-900 px-4 py-3"
+      style={{ borderRadius: "8px" }}
+    >
+      <div className="text-[22px] font-semibold tabular-nums text-ink-100">
+        {value}
+      </div>
+      <div className="mt-1 text-[11px] text-ink-400">{label}</div>
+      {sub && <div className="mt-0.5 text-[10px] text-ink-500">{sub}</div>}
     </div>
   );
 }
@@ -27,20 +43,29 @@ function StatCard({ label, value }: Stat) {
 const EVENT_LABELS: Record<string, string> = {
   account_opened: "Account opened",
   artifacts_gathered: "Artifacts gathered",
+  triage_pipeline_run: "Auto Triage pipeline",
   report_generated: "Report generated (LLM)",
   report_viewed_cached: "Report viewed (cache)",
-  pdf_exported: "PDF exported",
   report_page_viewed: "Report page viewed",
+  report_downloaded_md: ".md downloaded",
+  pdf_exported: "PDF exported",
+  risk_status_changed: "Risk status changed",
   lgtm_approved: "LGTM approved",
 };
+
+/** Number of ms for a given window. `all` maps to Infinity. */
+const windowMs = (w: Window) =>
+  w === "30d" ? 30 * 86400_000 : w === "90d" ? 90 * 86400_000 : Infinity;
 
 export default function UsagePage() {
   const [events, setEvents] = useState<EventDoc[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [windowSel, setWindowSel] = useState<Window>("30d");
 
   useEffect(() => {
-    fetch("/api/track?limit=2000")
+    setLoading(true);
+    fetch("/api/track?limit=5000")
       .then((r) => r.json())
       .then((j) => {
         if (j.ok) setEvents(j.events ?? []);
@@ -50,16 +75,135 @@ export default function UsagePage() {
       .finally(() => setLoading(false));
   }, []);
 
-  // Aggregate stats
-  const total = events.length;
-  const llmCalls = events.filter((e) => e.event === "report_generated").length;
-  const cacheHits = events.filter((e) => e.event === "report_viewed_cached").length;
-  const cacheRate = total ? `${Math.round((cacheHits / (llmCalls + cacheHits || 1)) * 100)}%` : "—";
-  const uniqueAccounts = new Set(events.map((e) => e.account).filter(Boolean)).size;
-  const uniqueUsers = new Set(events.map((e) => e.userId).filter(Boolean)).size;
-  const pdfs = events.filter((e) => e.event === "pdf_exported").length;
+  const filtered = useMemo(() => {
+    const cutoff = Date.now() - windowMs(windowSel);
+    if (!isFinite(cutoff)) return events;
+    return events.filter((e) => new Date(e.ts).getTime() >= cutoff);
+  }, [events, windowSel]);
 
-  // Accounts with no LLM report in > 30 days
+  // ---------- aggregate metrics ----------
+  const total = filtered.length;
+  const reportsGenerated = filtered.filter(
+    (e) => e.event === "report_generated",
+  ).length;
+  const reportsViewed = filtered.filter(
+    (e) => e.event === "report_page_viewed" || e.event === "report_viewed_cached",
+  ).length;
+  const pdfDownloads = filtered.filter((e) => e.event === "pdf_exported").length;
+  const mdDownloads = filtered.filter(
+    (e) => e.event === "report_downloaded_md",
+  ).length;
+  const uniqueAccounts = new Set(
+    filtered.map((e) => e.account).filter(Boolean),
+  ).size;
+  const uniqueUsers = new Set(
+    filtered.map((e) => e.userEmail || e.userId).filter(Boolean),
+  ).size;
+
+  // Auto Triage cache savings — the big new number from the cache layer.
+  const triageRuns = filtered.filter((e) => e.event === "triage_pipeline_run");
+  const triageCacheReused = triageRuns.reduce((sum, e) => {
+    const m = e.metadata ?? {};
+    const v = (m as { promptsReused?: number }).promptsReused ?? 0;
+    return sum + v;
+  }, 0);
+  const triageCacheFetched = triageRuns.reduce((sum, e) => {
+    const m = e.metadata ?? {};
+    const v = (m as { promptsFetched?: number }).promptsFetched ?? 0;
+    return sum + v;
+  }, 0);
+  const triageCachePct =
+    triageCacheReused + triageCacheFetched > 0
+      ? Math.round(
+          (triageCacheReused / (triageCacheReused + triageCacheFetched)) * 100,
+        )
+      : null;
+
+  // ---------- per-report table ----------
+  interface AccountAgg {
+    account: string;
+    lastGenerated?: string;
+    reports: number;
+    views: number;
+    pdfs: number;
+    mds: number;
+    triageRuns: number;
+    triageReused: number;
+    triageFetched: number;
+  }
+  const byAccount: Record<string, AccountAgg> = {};
+  for (const e of filtered) {
+    if (!e.account) continue;
+    const a = (byAccount[e.account] ??= {
+      account: e.account,
+      reports: 0,
+      views: 0,
+      pdfs: 0,
+      mds: 0,
+      triageRuns: 0,
+      triageReused: 0,
+      triageFetched: 0,
+    });
+    if (e.event === "report_generated") {
+      a.reports++;
+      if (!a.lastGenerated || e.ts > a.lastGenerated) a.lastGenerated = e.ts;
+    } else if (
+      e.event === "report_page_viewed" ||
+      e.event === "report_viewed_cached"
+    ) {
+      a.views++;
+    } else if (e.event === "pdf_exported") {
+      a.pdfs++;
+    } else if (e.event === "report_downloaded_md") {
+      a.mds++;
+    } else if (e.event === "triage_pipeline_run") {
+      a.triageRuns++;
+      const m = (e.metadata ?? {}) as {
+        promptsReused?: number;
+        promptsFetched?: number;
+      };
+      a.triageReused += m.promptsReused ?? 0;
+      a.triageFetched += m.promptsFetched ?? 0;
+    }
+  }
+  const accountRows = Object.values(byAccount).sort((a, b) => {
+    if (a.lastGenerated && b.lastGenerated) {
+      return b.lastGenerated.localeCompare(a.lastGenerated);
+    }
+    if (a.lastGenerated) return -1;
+    if (b.lastGenerated) return 1;
+    return b.reports + b.views - (a.reports + a.views);
+  });
+
+  // ---------- 30-day daily trend ----------
+  const dailyReports = useMemo(() => {
+    const bucket: Record<string, number> = {};
+    const cutoff = Date.now() - 30 * 86400_000;
+    for (const e of events) {
+      if (e.event !== "report_generated") continue;
+      const t = new Date(e.ts).getTime();
+      if (t < cutoff) continue;
+      const k = new Date(e.ts).toISOString().slice(0, 10);
+      bucket[k] = (bucket[k] ?? 0) + 1;
+    }
+    const days: { date: string; count: number }[] = [];
+    for (let i = 29; i >= 0; i--) {
+      const d = new Date(Date.now() - i * 86400_000).toISOString().slice(0, 10);
+      days.push({ date: d, count: bucket[d] ?? 0 });
+    }
+    return days;
+  }, [events]);
+  const maxDaily = Math.max(1, ...dailyReports.map((d) => d.count));
+
+  // ---------- events-by-type ----------
+  const byEvent = Object.entries(
+    filtered.reduce<Record<string, number>>((acc, e) => {
+      acc[e.event] = (acc[e.event] ?? 0) + 1;
+      return acc;
+    }, {}),
+  ).sort((a, b) => b[1] - a[1]);
+
+  // ---------- stale accounts (for planning) ----------
   const lastReportByAccount: Record<string, number> = {};
   for (const e of events) {
     if (e.event === "report_generated" && e.account) {
@@ -69,38 +213,27 @@ export default function UsagePage() {
       }
     }
   }
-  const staleCutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const staleCutoff = Date.now() - 30 * 86400_000;
   const staleAccounts = Object.entries(lastReportByAccount)
     .filter(([, t]) => t < staleCutoff)
-    .map(([a]) => a);
+    .map(([a]) => a)
+    .sort();
 
-  // Event breakdown
-  const byEvent = Object.entries(
-    events.reduce<Record<string, number>>((acc, e) => {
-      acc[e.event] = (acc[e.event] ?? 0) + 1;
-      return acc;
-    }, {}),
-  ).sort((a, b) => b[1] - a[1]);
-
-  // Top accounts by activity
-  const byAccount = Object.entries(
-    events.reduce<Record<string, number>>((acc, e) => {
-      if (e.account) acc[e.account] = (acc[e.account] ?? 0) + 1;
-      return acc;
-    }, {}),
-  )
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 10);
-
-  // Recent events
-  const recent = events.slice(0, 50);
+  const recent = filtered.slice(0, 50);
 
   if (loading) {
-    return <div className="text-ink-400 text-sm py-16 text-center">Loading usage data…</div>;
+    return (
+      <div className="text-ink-400 text-sm py-16 text-center">
+        Loading usage data…
+      </div>
+    );
   }
   if (error) {
     return (
-      <div className="border border-[#be6464] px-4 py-3 text-sm text-[#be6464] bg-[#fdf5f5]" style={{ borderRadius: '3px' }}>
+      <div
+        className="border border-danger/40 bg-danger/10 px-4 py-3 text-sm text-danger"
+        style={{ borderRadius: "8px" }}
+      >
         {error}
       </div>
     );
@@ -108,37 +241,186 @@ export default function UsagePage() {
 
   return (
     <div className="space-y-8">
-      <div>
-        <h1 className="text-2xl font-semibold tracking-tight">Usage Dashboard</h1>
-        <p className="text-sm text-ink-400 mt-1">All-time activity across accounts and users.</p>
+      <div className="flex items-start justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-[22px] font-semibold tracking-tight text-ink-100">
+            Usage Dashboard
+          </h1>
+          <p className="mt-2 text-[13px] text-ink-400">
+            Global view across all users · {uniqueUsers} unique{" "}
+            {uniqueUsers === 1 ? "user" : "users"} · {uniqueAccounts} unique
+            accounts
+          </p>
+        </div>
+        <div className="flex gap-1 border border-ink-700 p-1" style={{ borderRadius: "8px" }}>
+          {(["30d", "90d", "all"] as Window[]).map((w) => (
+            <button
+              key={w}
+              onClick={() => setWindowSel(w)}
+              className={`px-3 py-1 text-[12px] rounded transition-colors ${
+                windowSel === w
+                  ? "bg-accent-700 text-ink-100"
+                  : "text-ink-400 hover:bg-accent-900"
+              }`}
+            >
+              {w === "30d" ? "Last 30d" : w === "90d" ? "Last 90d" : "All time"}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* KPI row */}
-      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
+        <StatCard label="Reports generated" value={reportsGenerated} />
+        <StatCard label="Report views" value={reportsViewed} />
+        <StatCard label="PDF downloads" value={pdfDownloads} />
+        <StatCard label=".md downloads" value={mdDownloads} />
+        <StatCard
+          label="Triage calls saved"
+          value={triageCacheReused}
+          sub={triageCachePct !== null ? `${triageCachePct}% cache rate` : "—"}
+        />
         <StatCard label="Total events" value={total} />
-        <StatCard label="LLM calls" value={llmCalls} />
-        <StatCard label="Cache hit rate" value={cacheRate} />
-        <StatCard label="Unique accounts" value={uniqueAccounts} />
-        <StatCard label="Unique users" value={uniqueUsers} />
-        <StatCard label="PDFs exported" value={pdfs} />
       </div>
 
-      <div className="grid lg:grid-cols-3 gap-6">
+      {/* 30-day trend */}
+      <Card>
+        <CardHeader
+          title="Reports per day — last 30 days"
+          subtitle={`${dailyReports.reduce((s, d) => s + d.count, 0)} reports over the window`}
+        />
+        <CardBody>
+          <svg viewBox="0 0 620 120" className="w-full h-[120px]">
+            {dailyReports.map((d, i) => {
+              const x = (i * 620) / dailyReports.length;
+              const w = 620 / dailyReports.length - 2;
+              const h = d.count > 0 ? (d.count / maxDaily) * 100 : 0;
+              const y = 100 - h;
+              return (
+                <g key={d.date}>
+                  <rect
+                    x={x}
+                    y={y}
+                    width={w}
+                    height={h}
+                    fill="#3B82F6"
+                    opacity={d.count > 0 ? 0.9 : 0.15}
+                    rx={2}
+                  >
+                    <title>{`${d.date}: ${d.count} report${d.count === 1 ? "" : "s"}`}</title>
+                  </rect>
+                </g>
+              );
+            })}
+            {/* Axis labels: start, middle, end date */}
+            <text x="0" y="116" fontSize="9" fill="#6B7280">
+              {dailyReports[0]?.date.slice(5)}
+            </text>
+            <text x="300" y="116" fontSize="9" fill="#6B7280" textAnchor="middle">
+              {dailyReports[15]?.date.slice(5)}
+            </text>
+            <text x="620" y="116" fontSize="9" fill="#6B7280" textAnchor="end">
+              {dailyReports[29]?.date.slice(5)}
+            </text>
+          </svg>
+        </CardBody>
+      </Card>
+
+      {/* Per-report table */}
+      <Card>
+        <CardHeader
+          title="Per-account activity"
+          subtitle={`${accountRows.length} account${accountRows.length === 1 ? "" : "s"} in window`}
+        />
+        <CardBody>
+          {accountRows.length === 0 ? (
+            <div className="text-ink-500 text-[13px]">No activity in window.</div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-[12px]">
+                <thead>
+                  <tr className="border-b border-ink-700 text-ink-400">
+                    <th className="text-left pb-2 pr-4">Account</th>
+                    <th className="text-left pb-2 pr-4">Last generated</th>
+                    <th className="text-right pb-2 pr-4">Reports</th>
+                    <th className="text-right pb-2 pr-4">Views</th>
+                    <th className="text-right pb-2 pr-4">PDF</th>
+                    <th className="text-right pb-2 pr-4">.md</th>
+                    <th className="text-right pb-2 pr-4">Triage runs</th>
+                    <th className="text-right pb-2">Triage cache %</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {accountRows.map((a) => {
+                    const total = a.triageReused + a.triageFetched;
+                    const pct = total > 0 ? Math.round((a.triageReused / total) * 100) : null;
+                    return (
+                      <tr
+                        key={a.account}
+                        className="border-b border-ink-700/50 hover:bg-accent-900"
+                      >
+                        <td className="py-2 pr-4 text-ink-200">
+                          <Link
+                            href={`/reports/${encodeURIComponent(a.account)}`}
+                            className="hover:text-accent-400"
+                          >
+                            {a.account}
+                          </Link>
+                        </td>
+                        <td className="py-2 pr-4 text-ink-400 whitespace-nowrap">
+                          {a.lastGenerated
+                            ? new Date(a.lastGenerated).toLocaleDateString("en-US", {
+                                month: "short",
+                                day: "numeric",
+                                year: "numeric",
+                              })
+                            : "—"}
+                        </td>
+                        <td className="py-2 pr-4 text-right tabular-nums text-ink-200">{a.reports}</td>
+                        <td className="py-2 pr-4 text-right tabular-nums text-ink-200">{a.views}</td>
+                        <td className="py-2 pr-4 text-right tabular-nums text-ink-300">{a.pdfs}</td>
+                        <td className="py-2 pr-4 text-right tabular-nums text-ink-300">{a.mds}</td>
+                        <td className="py-2 pr-4 text-right tabular-nums text-ink-300">{a.triageRuns}</td>
+                        <td className="py-2 text-right tabular-nums text-ink-300">
+                          {pct !== null ? `${pct}%` : "—"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </CardBody>
+      </Card>
+
+      <div className="grid lg:grid-cols-2 gap-6">
         {/* Event breakdown */}
         <Card>
           <CardHeader title="Events by type" />
           <CardBody>
             <div className="space-y-2">
+              {byEvent.length === 0 && <div className="text-ink-500 text-xs">No events.</div>}
               {byEvent.map(([evt, count]) => {
-                const pct = Math.round((count / total) * 100);
+                const pct = total ? Math.round((count / total) * 100) : 0;
                 return (
                   <div key={evt}>
-                    <div className="flex justify-between text-xs mb-1">
-                      <span className="text-ink-200">{EVENT_LABELS[evt] ?? evt}</span>
-                      <span className="text-ink-400 tabular-nums">{count} ({pct}%)</span>
+                    <div className="flex justify-between text-[12px] mb-1">
+                      <span className="text-ink-200">
+                        {EVENT_LABELS[evt] ?? evt}
+                      </span>
+                      <span className="text-ink-400 tabular-nums">
+                        {count} ({pct}%)
+                      </span>
                     </div>
-                    <div className="w-full bg-ink-800 rounded-full h-1">
-                      <div className="bg-accent-500 h-1 rounded-full" style={{ width: `${pct}%` }} />
+                    <div
+                      className="w-full bg-ink-700 h-1"
+                      style={{ borderRadius: "9999px" }}
+                    >
+                      <div
+                        className="bg-accent-500 h-1"
+                        style={{ width: `${pct}%`, borderRadius: "9999px" }}
+                      />
                     </div>
                   </div>
                 );
@@ -147,35 +429,28 @@ export default function UsagePage() {
           </CardBody>
         </Card>
 
-        {/* Top accounts */}
-        <Card>
-          <CardHeader title="Most active accounts" />
-          <CardBody>
-            <div className="space-y-2">
-              {byAccount.map(([account, count]) => (
-                <div key={account} className="flex justify-between items-center text-sm">
-                  <span className="text-ink-200 truncate max-w-[180px]">{account}</span>
-                  <span className="text-ink-400 tabular-nums text-xs">{count} events</span>
-                </div>
-              ))}
-              {byAccount.length === 0 && <div className="text-ink-500 text-xs">No data</div>}
-            </div>
-          </CardBody>
-        </Card>
-
         {/* Stale accounts */}
         <Card>
-          <CardHeader title="No report in 30+ days" />
+          <CardHeader
+            title="No report in 30+ days"
+            subtitle="(all-time, not filtered by window)"
+          />
           <CardBody>
             {staleAccounts.length === 0 ? (
-              <div className="text-[#8dc572] text-sm">All accounts reported recently ✓</div>
+              <div className="text-success text-[13px]">
+                All accounts have a report within the last 30 days ✓
+              </div>
             ) : (
-              <div className="space-y-1">
+              <div className="space-y-1 max-h-[200px] overflow-y-auto">
                 {staleAccounts.map((a) => (
-                  <div key={a} className="flex items-center gap-2 text-sm">
-                    <span className="w-2 h-2 rounded-full bg-[#f0ad4e] flex-shrink-0" />
+                  <Link
+                    key={a}
+                    href={`/reports/${encodeURIComponent(a)}`}
+                    className="flex items-center gap-2 text-[13px] hover:text-accent-400"
+                  >
+                    <span className="w-2 h-2 rounded-full bg-warn flex-shrink-0" />
                     <span className="text-ink-200">{a}</span>
-                  </div>
+                  </Link>
                 ))}
               </div>
             )}
@@ -183,14 +458,14 @@ export default function UsagePage() {
         </Card>
       </div>
 
-      {/* Recent events table */}
+      {/* Recent events */}
       <Card>
-        <CardHeader title="Recent events" subtitle="Last 50 events, newest first" />
+        <CardHeader title="Recent events" subtitle="Last 50 events in window" />
         <CardBody>
           <div className="overflow-x-auto">
-            <table className="w-full text-xs">
+            <table className="w-full text-[11px]">
               <thead>
-                <tr className="border-b border-ink-800 text-ink-400">
+                <tr className="border-b border-ink-700 text-ink-400">
                   <th className="text-left pb-2 pr-4">Time</th>
                   <th className="text-left pb-2 pr-4">Event</th>
                   <th className="text-left pb-2 pr-4">Account</th>
@@ -200,21 +475,29 @@ export default function UsagePage() {
               </thead>
               <tbody>
                 {recent.map((e, i) => (
-                  <tr key={i} className="border-b border-ink-800/50 hover:bg-ink-800/20">
-                    <td className="py-2 pr-4 text-ink-400 whitespace-nowrap">
-                      {new Date(e.ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
+                  <tr
+                    key={i}
+                    className="border-b border-ink-700/50 hover:bg-accent-900"
+                  >
+                    <td className="py-1.5 pr-4 text-ink-400 whitespace-nowrap">
+                      {new Date(e.ts).toLocaleString("en-US", {
+                        month: "short",
+                        day: "numeric",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}
                     </td>
-                    <td className="py-2 pr-4 text-ink-200 whitespace-nowrap">
+                    <td className="py-1.5 pr-4 text-ink-200 whitespace-nowrap">
                       {EVENT_LABELS[e.event] ?? e.event}
                     </td>
-                    <td className="py-2 pr-4 text-ink-300 truncate max-w-[140px]">
+                    <td className="py-1.5 pr-4 text-ink-300 truncate max-w-[140px]">
                       {e.account ?? "—"}
                     </td>
-                    <td className="py-2 pr-4 text-ink-500 font-mono">
-                      {e.userId ? e.userId.slice(0, 12) : "—"}
+                    <td className="py-1.5 pr-4 text-ink-500 truncate max-w-[160px]">
+                      {e.userEmail ?? (e.userId ? e.userId.slice(0, 12) : "—")}
                     </td>
-                    <td className="py-2 text-ink-500 truncate max-w-[200px]">
-                      {e.metadata ? JSON.stringify(e.metadata).slice(0, 80) : "—"}
+                    <td className="py-1.5 text-ink-500 truncate max-w-[240px] font-mono">
+                      {e.metadata ? JSON.stringify(e.metadata).slice(0, 120) : "—"}
                     </td>
                   </tr>
                 ))}
